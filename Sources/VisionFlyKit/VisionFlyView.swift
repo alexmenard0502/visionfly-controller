@@ -63,6 +63,8 @@ final class DroneDiagnostics: ObservableObject {
     @Published private(set) var benchStatus = "No motor command tested"
     private var benchTask: Task<Void, Never>?
     private var benchID = UUID()
+    private var stopTask: Task<Void, Never>?
+    @Published private(set) var stopRunning = false
     @Published private(set) var benchSent = 0
     @Published var includeCommandInChecksum = true
     private var activeChecksumIncludesCommand = true
@@ -105,18 +107,32 @@ final class DroneDiagnostics: ObservableObject {
             benchStatus = "No control path — power off drone"
             return
         }
+        stopTask?.cancel()
+        // WiFi_CAM documents emergency stop, not a separate lock flag.
+        activeChecksumIncludesCommand = true
         sendBench(0x04, connection: c)
-        sendBench(0x20, connection: c)
-        benchStatus = "Stop/lock sent locally; verify motors stopped"
-        log("Stop/lock requested; no aircraft acknowledgement")
+        let id = session
+        stopRunning = true
+        benchStatus = "Stop requested — verify motors stopped; power off"
+        log("Emergency stop requested; no aircraft acknowledgement")
+        stopTask = Task { @MainActor [weak self] in
+            for _ in 0..<24 {
+                try? await Task.sleep(nanoseconds: 40_000_000)
+                guard let self = self, !Task.isCancelled, self.session == id,
+                      self.controlReady else { break }
+                self.sendBench(0x04, connection: c)
+            }
+            guard let self = self, !Task.isCancelled, self.session == id else { return }
+            self.stopRunning = false
+        }
     }
 
     func runBench(calibrate: Bool) {
         guard !benchRunning, videoReady, controlReady, heartbeatRunning,
               let c = control, let last = lastPacket,
               Date().timeIntervalSince(last) < 2 else { return }
-        // Only the non-throttle calibration diagnostic is exposed in V6.
-        guard calibrate else { return }
+        guard !stopRunning, appState == "Active",
+              calibrate || includeCommandInChecksum else { return }
         stopHeartbeat()
         activeChecksumIncludesCommand = includeCommandInChecksum
         benchSent = 0
@@ -124,10 +140,10 @@ final class DroneDiagnostics: ObservableObject {
         let token = UUID()
         benchID = token
         benchRunning = true
-        benchStatus = calibrate ? "Calibration pulse in progress" : "Unlock pulse in progress"
+        benchStatus = calibrate ? "Calibration pulse in progress" : "Motor-start pulse in progress"
         log(benchStatus + (activeChecksumIncludesCommand ? " / WiFi_CAM checksum" : " / axes-only checksum"))
         benchTask = Task { @MainActor [weak self] in
-            let count = calibrate ? 38 : 12
+            let count = calibrate ? 38 : 20
             for _ in 0..<count {
                 guard let self = self, !Task.isCancelled, self.session == id,
                       self.benchID == token else { return }
@@ -136,17 +152,17 @@ final class DroneDiagnostics: ObservableObject {
                     self.emergencyStop()
                     return
                 }
-                self.sendBench(calibrate ? 0x80 : 0x40, connection: c)
+                self.sendBench(calibrate ? 0x80 : 0x01, connection: c)
                 try? await Task.sleep(nanoseconds: 40_000_000)
             }
             guard let self = self, !Task.isCancelled, self.session == id,
                   self.benchID == token else { return }
-            // Calibration alone does not need a motor unlock or stop sequence.
-            // Stop transmission and require a manual heartbeat restart.
-            self.cancelBench()
-            self.benchStatus = calibrate
-                ? "Calibration pulse complete — observe LEDs"
-                : "Unlock pulse complete; stop/lock sent — verify motors stopped"
+            if calibrate {
+                self.cancelBench()
+                self.benchStatus = "Calibration pulse complete — observe LEDs"
+            } else {
+                self.emergencyStop()
+            }
             // Require explicit user restart after every pulse; never auto-resume.
         }
     }
@@ -289,7 +305,7 @@ final class DroneDiagnostics: ObservableObject {
     // Idle heartbeat documented for the similar WIFI_8K_ hardware.
     // This is unverified on this aircraft: props must be removed.
     func startHeartbeat() {
-        guard videoReady, controlReady, !heartbeatRunning, !benchRunning, let c = control else { return }
+        guard videoReady, controlReady, !heartbeatRunning, !benchRunning, !stopRunning, let c = control else { return }
         let id = session
         heartbeatRunning = true
         heartbeatCount = 0
@@ -324,6 +340,9 @@ final class DroneDiagnostics: ObservableObject {
     func disconnect() {
         if benchRunning { emergencyStop() }
         cancelBench()
+        stopTask?.cancel()
+        stopTask = nil
+        stopRunning = false
         session = UUID()
         stopHeartbeat()
         monitor?.cancel()
@@ -358,13 +377,14 @@ public struct VisionFlyView: View {
     public init() {}
     @StateObject private var drone = DroneDiagnostics()
     @State private var propsRemoved = false
+    @State private var confirmMotor = false
     @Environment(\.scenePhase) private var scenePhase
 
     public var body: some View {
         NavigationStack {
             Form {
                 Section("Safety — bench only") {
-                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V6 compares calibration checksums only. Keep clear and be ready to cut power. No unlock, takeoff or throttle increase is provided.")
+                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V7 includes an experimental motor-start (takeoff flag) pulse. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
                         .foregroundStyle(.red)
                     Toggle("All propellers removed", isOn: $propsRemoved)
                         .onChange(of: propsRemoved) { _, value in
@@ -404,20 +424,28 @@ public struct VisionFlyView: View {
                         .disabled(!propsRemoved || !drone.videoReady || drone.benchRunning)
                     Text(drone.videoSend).font(.footnote)
                     Button("Start 60-second idle heartbeat") { drone.startHeartbeat() }
-                        .disabled(!propsRemoved || !drone.videoReady || !drone.controlReady || drone.heartbeatRunning || drone.benchRunning || drone.lastPacket == nil)
+                        .disabled(!propsRemoved || !drone.videoReady || !drone.controlReady || drone.heartbeatRunning || drone.benchRunning || drone.stopRunning || drone.lastPacket == nil)
                     Button("Stop heartbeat") { drone.stopHeartbeat() }
                         .disabled(!drone.heartbeatRunning)
                     LabeledContent("Heartbeats sent locally", value: "\(drone.heartbeatCount)")
                 }
                 Section("Motor protocol — bench only") {
-                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Restart the heartbeat manually before each test. Compare checksum modes only after observing the first result.")
+                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Restart the heartbeat manually before each test. Calibrate first. Leave WiFi_CAM checksum enabled for motor-start. Power off after the motor test.")
                         .font(.footnote)
                     Toggle("WiFi_CAM checksum (include command)", isOn: $drone.includeCommandInChecksum)
                         .disabled(drone.benchRunning)
                     LabeledContent("Bench packets sent locally", value: "\(drone.benchSent)")
                     Button("Calibrate gyro (1.5 s)") { drone.runBench(calibrate: true) }
                         .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning)
-                    Button("STOP / LOCK", role: .destructive) { drone.emergencyStop() }
+                    Button("Motor-start bench test (0.8 s)", role: .destructive) { confirmMotor = true }
+                        .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning || drone.stopRunning || !drone.includeCommandInChecksum)
+                        .confirmationDialog("All propellers removed, drone secured, power switch accessible?", isPresented: $confirmMotor, titleVisibility: .visible) {
+                            Button("Run brief motor-start test", role: .destructive) {
+                                if propsRemoved { drone.runBench(calibrate: false) }
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        }
+                    Button("EMERGENCY STOP", role: .destructive) { drone.emergencyStop() }
                         .disabled(!drone.controlReady)
                     Text(drone.benchStatus).font(.footnote)
                     Text("Stop delivery is not guaranteed. If motors keep turning, disconnect drone power safely. No response does not prove the protocol is wrong.")
@@ -435,6 +463,7 @@ public struct VisionFlyView: View {
                     }
                     LabeledContent("App state", value: drone.appState)
                     Button("Disconnect") { drone.disconnect() }
+                        .disabled(drone.benchRunning || drone.stopRunning)
                 }
                 Section("Network event log (newest first)") {
                     ForEach(Array(drone.events.enumerated()), id: \.offset) { item in
@@ -442,11 +471,11 @@ public struct VisionFlyView: View {
                     }
                 }
                 Section("Limitations") {
-                    Text("UDP readiness does not prove the aircraft receives control commands. Heartbeat send counts are not acknowledgements. JPEG decoding is experimental; missing or reordered packets may corrupt frames. No verified flight controls or failsafe. Do not fly this test.")
+                    Text("UDP readiness does not prove the aircraft receives control commands. Heartbeat send counts are not acknowledgements. JPEG decoding is experimental; missing or reordered packets may corrupt frames. No verified flight controls or failsafe. Motor-start and stop are experimental. Do not fly this test.")
                         .font(.footnote)
                 }
             }
-            .navigationTitle("VisionFly Diagnostics V6")
+            .navigationTitle("VisionFly Bench V7")
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
