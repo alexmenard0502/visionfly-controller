@@ -59,6 +59,84 @@ final class DroneDiagnostics: ObservableObject {
     @Published var events: [String] = []
     private var monitor: NWPathMonitor?
     private var heartbeatTask: Task<Void, Never>?
+    @Published private(set) var benchRunning = false
+    @Published private(set) var benchStatus = "No motor command tested"
+    private var benchTask: Task<Void, Never>?
+    private var benchID = UUID()
+
+    // E58-style packet, independently implemented from the documented wire format.
+    // https://github.com/popolony2k/maritaca-e88-controller
+    // No throttle increase or automatic takeoff in this bench version.
+    private func sendBench(_ flag: UInt8, connection c: NWConnection) {
+        let r: UInt8 = 0x80, p: UInt8 = 0x80, t: UInt8 = 0, y: UInt8 = 0x80
+        let id = session
+        c.send(content: Data([0x66, r, p, t, y, flag, r ^ p ^ t ^ y, 0x99]),
+               completion: .contentProcessed { [weak self] error in
+            Task { @MainActor in
+                guard let self = self, self.session == id else { return }
+                if let error = error {
+                    self.log("Bench send error: \(error)")
+                    self.benchStatus = "Send failed — power off drone"
+                    self.cancelBench()
+                    self.stopHeartbeat()
+                }
+            }
+        })
+    }
+
+    private func cancelBench() {
+        benchID = UUID()
+        benchTask?.cancel()
+        benchTask = nil
+        benchRunning = false
+    }
+
+    func emergencyStop() {
+        cancelBench()
+        stopHeartbeat()
+        guard controlReady, let c = control else {
+            benchStatus = "No control path — power off drone"
+            return
+        }
+        sendBench(0x04, connection: c)
+        sendBench(0x20, connection: c)
+        benchStatus = "Stop/lock sent locally; verify motors stopped"
+        log("Stop/lock requested; no aircraft acknowledgement")
+    }
+
+    func runBench(calibrate: Bool) {
+        guard !benchRunning, videoReady, controlReady, heartbeatRunning,
+              let c = control, let last = lastPacket,
+              Date().timeIntervalSince(last) < 2 else { return }
+        stopHeartbeat()
+        let id = session
+        let token = UUID()
+        benchID = token
+        benchRunning = true
+        benchStatus = calibrate ? "Calibration pulse in progress" : "Unlock pulse in progress"
+        log(benchStatus)
+        benchTask = Task { @MainActor [weak self] in
+            let count = calibrate ? 38 : 12
+            for _ in 0..<count {
+                guard let self = self, !Task.isCancelled, self.session == id,
+                      self.benchID == token else { return }
+                guard self.controlReady, self.videoReady,
+                      let last = self.lastPacket, Date().timeIntervalSince(last) < 2 else {
+                    self.emergencyStop()
+                    return
+                }
+                self.sendBench(calibrate ? 0x80 : 0x40, connection: c)
+                try? await Task.sleep(nanoseconds: 40_000_000)
+            }
+            guard let self = self, !Task.isCancelled, self.session == id,
+                  self.benchID == token else { return }
+            self.emergencyStop()
+            self.benchStatus = calibrate
+                ? "Calibration pulse complete; stop/lock sent — observe LEDs"
+                : "Unlock pulse complete; stop/lock sent — verify motors stopped"
+            if self.videoReady && self.controlReady { self.startHeartbeat() }
+        }
+    }
     private func log(_ message: String) {
         events.insert("\(Date().formatted(date: .omitted, time: .standard))  \(message)", at: 0)
         if events.count > 18 { events.removeLast() }
@@ -132,7 +210,10 @@ final class DroneDiagnostics: ObservableObject {
             controlState = description
             if case .ready = state { controlReady = true } else { controlReady = false }
         }
-        if !videoReady || !controlReady { stopHeartbeat() }
+        if !videoReady || !controlReady {
+            if benchRunning { emergencyStop() }
+            stopHeartbeat()
+        }
         log("UDP \(videoPort ? 8080 : 8090): " + description)
     }
 
@@ -169,6 +250,7 @@ final class DroneDiagnostics: ObservableObject {
                 if let error = error {
                     self.videoState = "Receive error: \(error)"
                     self.videoReady = false
+                    if self.benchRunning { self.emergencyStop() }
                     self.stopHeartbeat()
                     self.log("Video receive error: \(error)")
                 } else {
@@ -194,7 +276,7 @@ final class DroneDiagnostics: ObservableObject {
     // Idle heartbeat documented for the similar WIFI_8K_ hardware.
     // This is unverified on this aircraft: props must be removed.
     func startHeartbeat() {
-        guard videoReady, controlReady, !heartbeatRunning, let c = control else { return }
+        guard videoReady, controlReady, !heartbeatRunning, !benchRunning, let c = control else { return }
         let id = session
         heartbeatRunning = true
         heartbeatCount = 0
@@ -227,6 +309,8 @@ final class DroneDiagnostics: ObservableObject {
     }
 
     func disconnect() {
+        if benchRunning { emergencyStop() }
+        cancelBench()
         session = UUID()
         stopHeartbeat()
         monitor?.cancel()
@@ -234,6 +318,7 @@ final class DroneDiagnostics: ObservableObject {
         wifiPath = "Not monitored"
         controlReady = false
         heartbeatCount = 0
+        benchStatus = "No motor command tested"
         packetPrefix = "None"
         assembler = JPEGAssembler()
         cameraImage = nil
@@ -260,13 +345,14 @@ public struct VisionFlyView: View {
     public init() {}
     @StateObject private var drone = DroneDiagnostics()
     @State private var propsRemoved = false
+    @State private var confirmUnlock = false
     @Environment(\.scenePhase) private var scenePhase
 
     public var body: some View {
         NavigationStack {
             Form {
                 Section("Safety — bench only") {
-                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. No unlock, takeoff or throttle commands are provided.")
+                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V5 can briefly unlock motors at zero throttle. Keep clear and be ready to cut power. No takeoff or throttle increase is provided.")
                         .foregroundStyle(.red)
                     Toggle("All propellers removed", isOn: $propsRemoved)
                         .onChange(of: propsRemoved) { _, value in
@@ -301,15 +387,34 @@ public struct VisionFlyView: View {
                     LabeledContent("Video UDP 8080", value: drone.videoState)
                     LabeledContent("Control UDP 8090", value: drone.controlState)
                     Button("Open UDP sockets") { drone.connect() }
-                        .disabled(!propsRemoved)
+                        .disabled(!propsRemoved || drone.benchRunning)
                     Button("Request video / Wi-Fi mode") { drone.requestVideo() }
-                        .disabled(!propsRemoved || !drone.videoReady)
+                        .disabled(!propsRemoved || !drone.videoReady || drone.benchRunning)
                     Text(drone.videoSend).font(.footnote)
                     Button("Start 60-second idle heartbeat") { drone.startHeartbeat() }
-                        .disabled(!propsRemoved || !drone.videoReady || !drone.controlReady || drone.heartbeatRunning || drone.lastPacket == nil)
+                        .disabled(!propsRemoved || !drone.videoReady || !drone.controlReady || drone.heartbeatRunning || drone.benchRunning || drone.lastPacket == nil)
                     Button("Stop heartbeat") { drone.stopHeartbeat() }
                         .disabled(!drone.heartbeatRunning)
                     LabeledContent("Heartbeats sent locally", value: "\(drone.heartbeatCount)")
+                }
+                Section("Motor protocol — bench only") {
+                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Start the heartbeat before each test.")
+                        .font(.footnote)
+                    Button("Calibrate gyro (1.5 s)") { drone.runBench(calibrate: true) }
+                        .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning)
+                    Button("Brief unlock (0.48 s)") { confirmUnlock = true }
+                        .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning)
+                        .confirmationDialog("All propellers removed and drone secured?", isPresented: $confirmUnlock, titleVisibility: .visible) {
+                            Button("Run unlock bench test", role: .destructive) {
+                                if propsRemoved { drone.runBench(calibrate: false) }
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        }
+                    Button("STOP / LOCK", role: .destructive) { drone.emergencyStop() }
+                        .disabled(!drone.controlReady)
+                    Text(drone.benchStatus).font(.footnote)
+                    Text("Stop delivery is not guaranteed. If motors keep turning, disconnect drone power safely. No response does not prove the protocol is wrong.")
+                        .font(.footnote)
                 }
                 Section("Incoming data") {
                     LabeledContent("Video packets", value: "\(drone.packetCount)")
@@ -334,13 +439,13 @@ public struct VisionFlyView: View {
                         .font(.footnote)
                 }
             }
-            .navigationTitle("VisionFly Camera V4")
+            .navigationTitle("VisionFly Bench V5")
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active: drone.appState = "Active"
-            case .inactive: drone.appState = "Inactive"; drone.stopHeartbeat()
-            case .background: drone.appState = "Background"; drone.stopHeartbeat()
+            case .inactive: drone.appState = "Inactive"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
+            case .background: drone.appState = "Background"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
             @unknown default: drone.appState = "Unknown"
             }
         }
