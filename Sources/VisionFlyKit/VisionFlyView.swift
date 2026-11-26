@@ -63,6 +63,9 @@ final class DroneDiagnostics: ObservableObject {
     @Published private(set) var benchStatus = "No motor command tested"
     private var benchTask: Task<Void, Never>?
     private var benchID = UUID()
+    @Published private(set) var benchSent = 0
+    @Published var includeCommandInChecksum = true
+    private var activeChecksumIncludesCommand = true
 
     // E58-style packet, independently implemented from the documented wire format.
     // https://github.com/popolony2k/maritaca-e88-controller
@@ -70,7 +73,9 @@ final class DroneDiagnostics: ObservableObject {
     private func sendBench(_ flag: UInt8, connection c: NWConnection) {
         let r: UInt8 = 0x80, p: UInt8 = 0x80, t: UInt8 = 0, y: UInt8 = 0x80
         let id = session
-        c.send(content: Data([0x66, r, p, t, y, flag, r ^ p ^ t ^ y, 0x99]),
+        let checksum = r ^ p ^ t ^ y ^ (activeChecksumIncludesCommand ? flag : 0)
+        let packet = Data([0x66, r, p, t, y, flag, checksum, 0x99])
+        c.send(content: packet,
                completion: .contentProcessed { [weak self] error in
             Task { @MainActor in
                 guard let self = self, self.session == id else { return }
@@ -79,6 +84,8 @@ final class DroneDiagnostics: ObservableObject {
                     self.benchStatus = "Send failed — power off drone"
                     self.cancelBench()
                     self.stopHeartbeat()
+                } else {
+                    self.benchSent += 1
                 }
             }
         })
@@ -108,13 +115,17 @@ final class DroneDiagnostics: ObservableObject {
         guard !benchRunning, videoReady, controlReady, heartbeatRunning,
               let c = control, let last = lastPacket,
               Date().timeIntervalSince(last) < 2 else { return }
+        // Only the non-throttle calibration diagnostic is exposed in V6.
+        guard calibrate else { return }
         stopHeartbeat()
+        activeChecksumIncludesCommand = includeCommandInChecksum
+        benchSent = 0
         let id = session
         let token = UUID()
         benchID = token
         benchRunning = true
         benchStatus = calibrate ? "Calibration pulse in progress" : "Unlock pulse in progress"
-        log(benchStatus)
+        log(benchStatus + (activeChecksumIncludesCommand ? " / WiFi_CAM checksum" : " / axes-only checksum"))
         benchTask = Task { @MainActor [weak self] in
             let count = calibrate ? 38 : 12
             for _ in 0..<count {
@@ -130,9 +141,11 @@ final class DroneDiagnostics: ObservableObject {
             }
             guard let self = self, !Task.isCancelled, self.session == id,
                   self.benchID == token else { return }
-            self.emergencyStop()
+            // Calibration alone does not need a motor unlock or stop sequence.
+            // Stop transmission and require a manual heartbeat restart.
+            self.cancelBench()
             self.benchStatus = calibrate
-                ? "Calibration pulse complete; stop/lock sent — observe LEDs"
+                ? "Calibration pulse complete — observe LEDs"
                 : "Unlock pulse complete; stop/lock sent — verify motors stopped"
             // Require explicit user restart after every pulse; never auto-resume.
         }
@@ -345,14 +358,13 @@ public struct VisionFlyView: View {
     public init() {}
     @StateObject private var drone = DroneDiagnostics()
     @State private var propsRemoved = false
-    @State private var confirmUnlock = false
     @Environment(\.scenePhase) private var scenePhase
 
     public var body: some View {
         NavigationStack {
             Form {
                 Section("Safety — bench only") {
-                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V5 can briefly unlock motors at zero throttle. Keep clear and be ready to cut power. No takeoff or throttle increase is provided.")
+                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V6 compares calibration checksums only. Keep clear and be ready to cut power. No unlock, takeoff or throttle increase is provided.")
                         .foregroundStyle(.red)
                     Toggle("All propellers removed", isOn: $propsRemoved)
                         .onChange(of: propsRemoved) { _, value in
@@ -398,18 +410,13 @@ public struct VisionFlyView: View {
                     LabeledContent("Heartbeats sent locally", value: "\(drone.heartbeatCount)")
                 }
                 Section("Motor protocol — bench only") {
-                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Restart the heartbeat manually before each test. Power-cycle the drone after the unlock test.")
+                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Restart the heartbeat manually before each test. Compare checksum modes only after observing the first result.")
                         .font(.footnote)
+                    Toggle("WiFi_CAM checksum (include command)", isOn: $drone.includeCommandInChecksum)
+                        .disabled(drone.benchRunning)
+                    LabeledContent("Bench packets sent locally", value: "\(drone.benchSent)")
                     Button("Calibrate gyro (1.5 s)") { drone.runBench(calibrate: true) }
                         .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning)
-                    Button("Brief unlock (0.48 s)") { confirmUnlock = true }
-                        .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning)
-                        .confirmationDialog("All propellers removed and drone secured?", isPresented: $confirmUnlock, titleVisibility: .visible) {
-                            Button("Run unlock bench test", role: .destructive) {
-                                if propsRemoved { drone.runBench(calibrate: false) }
-                            }
-                            Button("Cancel", role: .cancel) {}
-                        }
                     Button("STOP / LOCK", role: .destructive) { drone.emergencyStop() }
                         .disabled(!drone.controlReady)
                     Text(drone.benchStatus).font(.footnote)
@@ -439,7 +446,7 @@ public struct VisionFlyView: View {
                         .font(.footnote)
                 }
             }
-            .navigationTitle("VisionFly Bench V5")
+            .navigationTitle("VisionFly Diagnostics V6")
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
