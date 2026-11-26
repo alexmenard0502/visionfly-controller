@@ -134,7 +134,7 @@ final class DroneDiagnostics: ObservableObject {
             self.benchStatus = calibrate
                 ? "Calibration pulse complete; stop/lock sent — observe LEDs"
                 : "Unlock pulse complete; stop/lock sent — verify motors stopped"
-            if self.videoReady && self.controlReady { self.startHeartbeat() }
+            // Require explicit user restart after every pulse; never auto-resume.
         }
     }
     private func log(_ message: String) {
@@ -398,7 +398,7 @@ public struct VisionFlyView: View {
                     LabeledContent("Heartbeats sent locally", value: "\(drone.heartbeatCount)")
                 }
                 Section("Motor protocol — bench only") {
-                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Start the heartbeat before each test.")
+                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Restart the heartbeat manually before each test. Power-cycle the drone after the unlock test.")
                         .font(.footnote)
                     Button("Calibrate gyro (1.5 s)") { drone.runBench(calibrate: true) }
                         .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning)
