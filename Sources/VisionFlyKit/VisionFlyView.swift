@@ -468,6 +468,7 @@ public struct VisionFlyView: View {
     @State private var propsRemoved = false
     @State private var confirmMotor = false
     @State private var joystickEnabled = false
+    @AppStorage("visionfly.cameraQuarterTurns") private var cameraQuarterTurns = 1
     @Environment(\.scenePhase) private var scenePhase
 
     private var leftAvailable: Bool {
@@ -495,9 +496,16 @@ public struct VisionFlyView: View {
                         ZStack {
                             Color.black
                             if fresh, let image = drone.cameraImage {
-                                Image(uiImage: image)
-                                    .resizable()
-                                    .scaledToFit()
+                                GeometryReader { geo in
+                                    let sideways = cameraQuarterTurns % 2 != 0
+                                    Image(uiImage: image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: sideways ? geo.size.height : geo.size.width,
+                                               height: sideways ? geo.size.width : geo.size.height)
+                                        .rotationEffect(.degrees(Double(cameraQuarterTurns) * 90))
+                                        .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                                }
                             } else {
                                 Text(drone.frameCount == 0 ? "Waiting for JPEG frames" : "Video stalled")
                                     .foregroundStyle(.white)
@@ -506,6 +514,22 @@ public struct VisionFlyView: View {
                         .aspectRatio(4.0 / 3.0, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
+                    HStack {
+                        Button {
+                            cameraQuarterTurns = (cameraQuarterTurns + 3) % 4
+                        } label: {
+                            Label("Rotate left", systemImage: "rotate.left")
+                        }
+                        .buttonStyle(.borderless)
+                        Spacer()
+                        Button {
+                            cameraQuarterTurns = (cameraQuarterTurns + 1) % 4
+                        } label: {
+                            Label("Rotate right", systemImage: "rotate.right")
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    LabeledContent("Camera rotation", value: "\(cameraQuarterTurns * 90)°")
                     LabeledContent("Decoded frames", value: "\(drone.frameCount)")
                     LabeledContent("JPEG decode failures", value: "\(drone.decodeFailures)")
                     if let image = drone.cameraImage, let cg = image.cgImage {
