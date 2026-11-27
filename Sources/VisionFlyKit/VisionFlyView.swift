@@ -578,98 +578,112 @@ public struct VisionFlyView: View {
 
     private var controllerScreen: some View {
         GeometryReader { geo in
-            let stickSize = min(geo.size.width * 0.31, geo.size.height * 0.43, 245)
-            ZStack {
-                Color.black
-                TimelineView(.periodic(from: .now, by: 0.5)) { context in
-                    let fresh = drone.lastFrame.map { context.date.timeIntervalSince($0) < 2 } ?? false
-                    if fresh, let image = drone.cameraImage {
-                        let sideways = cameraQuarterTurns % 2 != 0
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: sideways ? geo.size.height : geo.size.width,
-                                   height: sideways ? geo.size.width : geo.size.height)
-                            .rotationEffect(.degrees(Double(cameraQuarterTurns) * 90))
-                            .position(x: geo.size.width / 2, y: geo.size.height / 2)
-                    } else {
-                        Text("No fresh video").foregroundStyle(.white)
+            let stickSize = min(geo.size.width * 0.43, geo.size.height * 0.27, 290)
+            VStack(spacing: 8) {
+                HStack {
+                    Button("Diagnostics") { exitController() }
+                    Spacer()
+                    Text("VisionFly V12").font(.headline)
+                    Spacer()
+                    Button {
+                        cameraQuarterTurns = (cameraQuarterTurns + 1) % 4
+                    } label: {
+                        Image(systemName: "rotate.right").frame(minWidth: 44, minHeight: 44)
                     }
+                    .accessibilityLabel("Rotate camera right")
                 }
-                .allowsHitTesting(false)
-                VStack(spacing: 8) {
-                    HStack {
-                        Button("Diagnostics") { exitController() }
-                        Spacer()
-                        Text("BENCH ONLY • NO VERIFIED FAILSAFE")
-                            .font(.caption2.bold()).foregroundStyle(.yellow)
-                        Spacer()
-                        Button {
-                            cameraQuarterTurns = (cameraQuarterTurns + 1) % 4
-                        } label: {
-                            Image(systemName: "rotate.right")
-                        }
-                        .accessibilityLabel("Rotate camera right")
-                    }
-                    .padding(8)
-                    .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 8))
-                    HStack(spacing: 10) {
-                        Button(drone.preparing ? "Connecting…" : "Connect & prepare") {
-                            if propsRemoved { joystickEnabled = true; drone.prepareController() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!propsRemoved || drone.preparing || drone.benchRunning || drone.stopRunning)
-                        Picker("Steering", selection: $drone.steeringSensitivity) {
-                            Text("Low").tag(40)
-                            Text("Med").tag(70)
-                            Text("High").tag(100)
-                        }
-                        .pickerStyle(.segmented)
-                        .disabled(drone.benchRunning || drone.stopRunning)
-                    }
-                    .padding(8)
-                    .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 8))
-                    TimelineView(.periodic(from: .now, by: 0.5)) { context in
-                        let recent = drone.lastPacket.map { context.date.timeIntervalSince($0) < 1 } ?? false
-                        let ready = drone.videoReady && drone.controlReady && recent
-                        Text(ready ? (drone.manualRunning ? "Commands active • no aircraft ACK" : (drone.heartbeatRunning ? "Ready — push left stick up" : "Connected — prepare again to start")) : "Link not ready / stale video")
-                            .font(.caption.bold())
-                            .foregroundStyle(ready ? Color.green : Color.orange)
-                            .padding(6)
-                            .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 6))
-                    }
-                    Spacer(minLength: 4)
-                    HStack(alignment: .bottom, spacing: 8) {
-                        BenchStick(title: "Throttle / Yaw", top: "Climb", bottom: "Descend",
-                                   enabled: leftAvailable, moved: { drone.moveLeft($0) },
-                                   released: { drone.releaseLeft() })
-                            .frame(width: stickSize)
-                        Spacer(minLength: 0)
-                        BenchStick(title: "Pitch / Roll", top: "Forward", bottom: "Back",
-                                   enabled: propsRemoved && joystickEnabled && drone.manualRunning,
-                                   moved: { drone.moveRight($0) }, released: { drone.releaseRight() })
-                            .frame(width: stickSize)
-                    }
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 6)
-                    .background(.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 12))
-                    Button(role: .destructive) { drone.emergencyStop() } label: {
-                        Text("STOP MOTORS").font(.headline).frame(maxWidth: .infinity)
+                .frame(height: 44)
+                HStack(spacing: 10) {
+                    Button(drone.preparing ? "Connecting…" : "Connect & prepare") {
+                        if propsRemoved { joystickEnabled = true; drone.prepareController() }
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                    .disabled(!drone.controlReady)
+                    .disabled(!propsRemoved || drone.preparing || drone.benchRunning || drone.stopRunning)
+                    Picker("Steering", selection: $drone.steeringSensitivity) {
+                        Text("Low").tag(40)
+                        Text("Med").tag(70)
+                        Text("High").tag(100)
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(drone.benchRunning || drone.stopRunning)
+                }
+                .frame(height: 44)
+                TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                    let recent = drone.lastPacket.map { context.date.timeIntervalSince($0) < 1 } ?? false
+                    let ready = drone.videoReady && drone.controlReady && recent
+                    Text(ready ? (drone.manualRunning ? "Commands active • no aircraft ACK" : (drone.heartbeatRunning ? "Ready — push left stick up" : "Connected — prepare again to start")) : "Link not ready / stale video")
+                        .font(.caption.bold())
+                        .foregroundStyle(ready ? Color.green : Color.orange)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .frame(maxWidth: .infinity)
+                }
+                .frame(height: 24)
+                // Flexible camera viewport: the fixed controls and stop button
+                // reserve their own space; video uses only the remainder.
+                GeometryReader { camera in
+                    TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                        let fresh = drone.lastFrame.map { context.date.timeIntervalSince($0) < 2 } ?? false
+                        ZStack {
+                            Color.black
+                            if fresh, let image = drone.cameraImage {
+                                let sideways = cameraQuarterTurns % 2 != 0
+                                Image(uiImage: image)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: sideways ? camera.size.height : camera.size.width,
+                                           height: sideways ? camera.size.width : camera.size.height)
+                                    .rotationEffect(.degrees(Double(cameraQuarterTurns) * 90))
+                                    .position(x: camera.size.width / 2, y: camera.size.height / 2)
+                            } else {
+                                Text("No fresh video").foregroundStyle(.white)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(Color.white.opacity(0.18))
+                }
+                .allowsHitTesting(false)
+                HStack(alignment: .center, spacing: 8) {
+                    BenchStick(title: "Throttle / Yaw", top: "Climb", bottom: "Descend",
+                               enabled: leftAvailable, moved: { drone.moveLeft($0) },
+                               released: { drone.releaseLeft() })
+                        .frame(width: stickSize)
+                    Spacer(minLength: 0)
+                    BenchStick(title: "Pitch / Roll", top: "Forward", bottom: "Back",
+                               enabled: propsRemoved && joystickEnabled && drone.manualRunning,
+                               moved: { drone.moveRight($0) }, released: { drone.releaseRight() })
+                        .frame(width: stickSize)
+                }
+                .frame(height: stickSize + 54)
+                .padding(.horizontal, 4)
+                Button(role: .destructive) { drone.emergencyStop() } label: {
+                    Text("STOP MOTORS")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(!drone.controlReady)
+                VStack(spacing: 2) {
+                    Text("BENCH ONLY • NO VERIFIED FAILSAFE")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.yellow)
                     Text(drone.manualRunning ? "60-second maximum • " + drone.manualChannels : drone.benchStatus)
                         .font(.caption2)
-                        .lineLimit(2)
-                        .padding(5)
-                        .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 6))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                 }
-                .padding(10)
-                .foregroundStyle(.white)
-                .environment(\.colorScheme, .dark)
+                .frame(height: 34)
             }
-            .clipped()
+            .padding(12)
+            .foregroundStyle(.white)
+            .background(Color(red: 0.07, green: 0.09, blue: 0.12))
+            .environment(\.colorScheme, .dark)
         }
     }
 
@@ -692,14 +706,14 @@ public struct VisionFlyView: View {
                         }
                 }
                 Section("Controller layout") {
-                    Button("Open landscape controller") {
+                    Button("Open portrait controller") {
                         guard propsRemoved else { return }
                         drone.controllerBenchMode = true
                         joystickEnabled = true
                         showController = true
                     }
                     .disabled(!propsRemoved || drone.benchRunning || drone.stopRunning)
-                    Text("Rotate iPad to landscape. Centered sticks keep sending neutral commands for up to 60 seconds after startup; press STOP MOTORS to end sooner. No verified aircraft-side failsafe. Propellers must remain removed.")
+                    Text("Hold the iPad vertically. Video and controls share one screen without scrolling. Centered sticks keep sending neutral commands for up to 60 seconds after startup; press STOP MOTORS to end sooner. No verified aircraft-side failsafe. Propellers must remain removed.")
                         .font(.footnote)
                 }
                 Section("Live camera — bench only") {
