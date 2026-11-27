@@ -72,8 +72,8 @@ final class DroneDiagnostics: ObservableObject {
     // E58-style packet, independently implemented from the documented wire format.
     // https://github.com/popolony2k/maritaca-e88-controller
     // Propeller-free bench diagnostics only; startup flags may spin motors.
-    private func sendBench(_ flag: UInt8, connection c: NWConnection) {
-        let r: UInt8 = 0x80, p: UInt8 = 0x80, t: UInt8 = 0, y: UInt8 = 0x80
+    private func sendBench(_ flag: UInt8, throttle t: UInt8 = 0, connection c: NWConnection) {
+        let r: UInt8 = 0x80, p: UInt8 = 0x80, y: UInt8 = 0x80
         let id = session
         let checksum = r ^ p ^ t ^ y ^ (activeChecksumIncludesCommand ? flag : 0)
         let packet = Data([0x66, r, p, t, y, flag, checksum, 0x99])
@@ -120,6 +120,7 @@ final class DroneDiagnostics: ObservableObject {
                 try? await Task.sleep(nanoseconds: 40_000_000)
                 guard let self = self, !Task.isCancelled, self.session == id,
                       self.controlReady else { break }
+                self.sendBench(0x00, throttle: 0x00, connection: c)
                 self.sendBench(0x04, connection: c)
             }
             guard let self = self, !Task.isCancelled, self.session == id else { return }
@@ -140,17 +141,17 @@ final class DroneDiagnostics: ObservableObject {
         let token = UUID()
         benchID = token
         benchRunning = true
-        benchStatus = calibrate ? "Calibration pulse in progress" : "Motor-start pulse in progress"
+        benchStatus = calibrate ? "Calibration pulse in progress" : "Joystick reproduction in progress"
         log(benchStatus + (activeChecksumIncludesCommand ? " / WiFi_CAM checksum" : " / axes-only checksum"))
         benchTask = Task { @MainActor [weak self] in
-            // Adapt the reference startup sequence to the checksum that elicited
-            // the V6 calibration response. Keep throttle at minimum throughout.
-            let stages: [(UInt8, Int, String)] = calibrate
-                ? [(0x80, 38, "Calibration")]
-                : [(0x80, 38, "Calibration"), (0x40, 13, "Unlock"), (0x01, 13, "Motor start"), (0x00, 13, "Minimum throttle")]
+            // Hypothesis from HQ-8K observed behavior, not a capture of HQ-8K.
+            // No explicit unlock/takeoff flags; bounded propeller-free test.
+            let stages: [(UInt8, UInt8, Int, String)] = calibrate
+                ? [(0x80, 0x00, 38, "Calibration")]
+                : [(0x00, 0x80, 13, "Centered stick"), (0x00, 0xC0, 15, "Stick up"), (0x00, 0x00, 38, "Stick fully down")]
             let clock = ContinuousClock()
             let deadline = clock.now.advanced(by: .seconds(4))
-            for (flag, count, label) in stages {
+            for (flag, throttle, count, label) in stages {
                 guard let self = self, !Task.isCancelled, self.session == id,
                       self.benchID == token else { return }
                 self.benchStatus = label + " — bench test"
@@ -163,7 +164,7 @@ final class DroneDiagnostics: ObservableObject {
                         self.emergencyStop()
                         return
                     }
-                    self.sendBench(flag, connection: c)
+                    self.sendBench(flag, throttle: throttle, connection: c)
                     try? await Task.sleep(nanoseconds: 40_000_000)
                 }
             }
@@ -396,11 +397,11 @@ public struct VisionFlyView: View {
         NavigationStack {
             Form {
                 Section("Safety — bench only") {
-                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V8 includes a short calibration/unlock/start sequence at minimum throttle. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
+                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V9 briefly reproduces center/up/down joystick input, without takeoff or unlock flags. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
                         .foregroundStyle(.red)
                     Toggle("All propellers removed", isOn: $propsRemoved)
                         .onChange(of: propsRemoved) { _, value in
-                            if !value { drone.disconnect() }
+                            if !value { if drone.benchRunning || drone.stopRunning { drone.emergencyStop() } else { drone.disconnect() } }
                         }
                 }
                 Section("Live camera — bench only") {
@@ -431,9 +432,9 @@ public struct VisionFlyView: View {
                     LabeledContent("Video UDP 8080", value: drone.videoState)
                     LabeledContent("Control UDP 8090", value: drone.controlState)
                     Button("Open UDP sockets") { drone.connect() }
-                        .disabled(!propsRemoved || drone.benchRunning)
+                        .disabled(!propsRemoved || drone.benchRunning || drone.stopRunning)
                     Button("Request video / Wi-Fi mode") { drone.requestVideo() }
-                        .disabled(!propsRemoved || !drone.videoReady || drone.benchRunning)
+                        .disabled(!propsRemoved || !drone.videoReady || drone.benchRunning || drone.stopRunning)
                     Text(drone.videoSend).font(.footnote)
                     Button("Start 60-second idle heartbeat") { drone.startHeartbeat() }
                         .disabled(!propsRemoved || !drone.videoReady || !drone.controlReady || drone.heartbeatRunning || drone.benchRunning || drone.stopRunning || drone.lastPacket == nil)
@@ -442,17 +443,17 @@ public struct VisionFlyView: View {
                     LabeledContent("Heartbeats sent locally", value: "\(drone.heartbeatCount)")
                 }
                 Section("Motor protocol — bench only") {
-                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Restart the heartbeat manually before each test. The combined test calibrates automatically. Leave WiFi_CAM checksum enabled. Power off after the motor test.")
+                    Text("Secure the aircraft, remove every propeller, and keep the power switch accessible. Restart the heartbeat manually before each test. The joystick test starts centered, briefly pushes up, then holds down and requests stop. Leave WiFi_CAM checksum enabled. Power off after the motor test.")
                         .font(.footnote)
                     Toggle("WiFi_CAM checksum (include command)", isOn: $drone.includeCommandInChecksum)
                         .disabled(drone.benchRunning)
                     LabeledContent("Bench packets sent locally", value: "\(drone.benchSent)")
                     Button("Calibrate gyro (1.5 s)") { drone.runBench(calibrate: true) }
                         .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning)
-                    Button("Combined startup bench test (3.1 s)", role: .destructive) { confirmMotor = true }
+                    Button("Joystick up/down bench test (2.6 s)", role: .destructive) { confirmMotor = true }
                         .disabled(!propsRemoved || !drone.heartbeatRunning || drone.benchRunning || drone.stopRunning || !drone.includeCommandInChecksum)
                         .confirmationDialog("All propellers removed, drone secured, power switch accessible?", isPresented: $confirmMotor, titleVisibility: .visible) {
-                            Button("Run combined startup bench test", role: .destructive) {
+                            Button("Run joystick up/down bench test", role: .destructive) {
                                 if propsRemoved { drone.runBench(calibrate: false) }
                             }
                             Button("Cancel", role: .cancel) {}
@@ -487,7 +488,7 @@ public struct VisionFlyView: View {
                         .font(.footnote)
                 }
             }
-            .navigationTitle("VisionFly Bench V8")
+            .navigationTitle("VisionFly Bench V9")
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
