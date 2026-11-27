@@ -72,9 +72,32 @@ final class DroneDiagnostics: ObservableObject {
     private var leftStick = CGPoint.zero
     private var rightStick = CGPoint.zero
 
-    // Limited bench ranges, not calibrated for flight.
+    // Full byte endpoints with exact center, or the original conservative ranges.
+    // Actual aircraft response to endpoints is not yet verified.
+    @Published var fullRangeBench = false
+    @Published private(set) var manualChannels = "T 128 | Y 128 | P 128 | R 128"
+    private var channelMin = [128, 128, 128, 128]
+    private var channelMax = [128, 128, 128, 128]
+    @Published private(set) var manualExtrema = "No manual test yet"
+    private var activeFullRange = false
+
     private func axis(_ input: CGFloat, range: CGFloat) -> UInt8 {
-        UInt8(max(0, min(255, Int((128 + max(-1, min(1, input)) * range).rounded()))))
+        let x = max(-1, min(1, input))
+        let span: CGFloat = activeFullRange ? (x < 0 ? 128 : 127) : range
+        return UInt8(max(0, min(255, Int((128 + x * span).rounded()))))
+    }
+
+    private func recordManual(throttle: UInt8, yaw: UInt8, pitch: UInt8, roll: UInt8) {
+        let values = [Int(throttle), Int(yaw), Int(pitch), Int(roll)]
+        let labels = ["T", "Y", "P", "R"]
+        let current = zip(labels, values).map { "\($0.0) \($0.1)" }.joined(separator: " | ")
+        if manualChannels != current { manualChannels = current }
+        for i in 0..<4 {
+            channelMin[i] = min(channelMin[i], values[i])
+            channelMax[i] = max(channelMax[i], values[i])
+        }
+        let extrema = (0..<4).map { "\(labels[$0]) \(channelMin[$0])–\(channelMax[$0])" }.joined(separator: " | ")
+        if manualExtrema != extrema { manualExtrema = extrema }
     }
 
     func moveLeft(_ point: CGPoint) {
@@ -88,6 +111,11 @@ final class DroneDiagnostics: ObservableObject {
               let last = lastPacket, Date().timeIntervalSince(last) < 1 else { return }
         stopHeartbeat()
         activeChecksumIncludesCommand = true
+        activeFullRange = fullRangeBench
+        channelMin = [128, 128, 128, 128]
+        channelMax = [128, 128, 128, 128]
+        manualChannels = "T 128 | Y 128 | P 128 | R 128"
+        manualExtrema = "T 128–128 | Y 128–128 | P 128–128 | R 128–128"
         benchSent = 0
         leftStick = point
         rightStick = .zero
@@ -100,9 +128,9 @@ final class DroneDiagnostics: ObservableObject {
         log("Manual joystick bench started")
         benchTask = Task { @MainActor [weak self] in
             let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(3))
+            let deadline = clock.now.advanced(by: .seconds(15))
             // Same centered prelude as the successful V9 sequence.
-            for tick in 0..<63 {
+            for tick in 0..<375 {
                 guard let self = self, !Task.isCancelled, self.session == id,
                       self.benchID == token, self.manualRunning else { return }
                 guard self.videoReady, self.controlReady, self.appState == "Active",
@@ -114,10 +142,12 @@ final class DroneDiagnostics: ObservableObject {
                 if tick < 13 {
                     self.sendBench(0, throttle: 128, connection: c)
                 } else {
-                    self.sendBench(0, throttle: self.axis(-self.leftStick.y, range: 64),
-                                   roll: self.axis(self.rightStick.x, range: 32),
-                                   pitch: self.axis(-self.rightStick.y, range: 32),
-                                   yaw: self.axis(self.leftStick.x, range: 32), connection: c)
+                    let t = self.axis(-self.leftStick.y, range: 64)
+                    let r = self.axis(self.rightStick.x, range: 32)
+                    let p = self.axis(-self.rightStick.y, range: 32)
+                    let y = self.axis(self.leftStick.x, range: 32)
+                    self.sendBench(0, throttle: t, roll: r, pitch: p, yaw: y, connection: c)
+                    self.recordManual(throttle: t, yaw: y, pitch: p, roll: r)
                 }
                 try? await Task.sleep(nanoseconds: 40_000_000)
             }
@@ -171,6 +201,7 @@ final class DroneDiagnostics: ObservableObject {
         benchTask = nil
         benchRunning = false
         manualRunning = false
+        manualChannels = "Idle — no manual packets"
         leftStick = .zero
         rightStick = .zero
     }
@@ -480,7 +511,7 @@ public struct VisionFlyView: View {
         NavigationStack {
             Form {
                 Section("Safety — bench only") {
-                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V10 adds short, limited manual joystick bench tests. Release the left stick to request shutdown. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
+                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V11 adds longer manual joystick bench tests and an optional full command range. Release the left stick to request shutdown. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
                         .foregroundStyle(.red)
                     Toggle("All propellers removed", isOn: $propsRemoved)
                         .onChange(of: propsRemoved) { _, value in
@@ -542,8 +573,16 @@ public struct VisionFlyView: View {
                         .onChange(of: joystickEnabled) { _, enabled in
                             if !enabled && drone.manualRunning { drone.emergencyStop() }
                         }
-                    Text("Start the heartbeat below, then hold the left stick up to start. Keep it held while testing the right stick. Release the left stick to stop. Every attempt times out after about 2.5 seconds; restart the heartbeat before another attempt. Directions are unverified.")
+                    Text("Start the heartbeat below, then hold the left stick up to start. Keep it held while testing the right stick. Release the left stick to stop. Each attempt has a 15-second maximum; restart the heartbeat before another attempt. Directions are unverified. Use full range only for brief endpoint checks with propellers removed.")
                         .font(.footnote)
+                    Toggle("Enable full 0–255 command range", isOn: $drone.fullRangeBench)
+                        .disabled(!propsRemoved || !joystickEnabled || drone.benchRunning || drone.stopRunning)
+                    LabeledContent("Manual command bytes", value: drone.manualChannels)
+                        .font(.caption.monospaced())
+                    LabeledContent("Last run min–max", value: drone.manualExtrema)
+                        .font(.caption.monospaced())
+                    Text("Values are generated command bytes, not aircraft telemetry or measured motor RPM.")
+                        .font(.caption)
                     HStack(alignment: .top, spacing: 16) {
                         BenchStick(title: "Throttle / Yaw", top: "Climb", bottom: "Descend",
                                    enabled: leftAvailable, moved: { drone.moveLeft($0) },
@@ -617,7 +656,7 @@ public struct VisionFlyView: View {
                         .font(.footnote)
                 }
             }
-            .navigationTitle("VisionFly Bench V10")
+            .navigationTitle("VisionFly Bench V11")
         }
         .onDisappear {
             if drone.benchRunning { drone.emergencyStop() }
