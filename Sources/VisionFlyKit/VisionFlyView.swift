@@ -68,12 +68,83 @@ final class DroneDiagnostics: ObservableObject {
     @Published private(set) var benchSent = 0
     @Published var includeCommandInChecksum = true
     private var activeChecksumIncludesCommand = true
+    @Published private(set) var manualRunning = false
+    private var leftStick = CGPoint.zero
+    private var rightStick = CGPoint.zero
+
+    // Limited bench ranges, not calibrated for flight.
+    private func axis(_ input: CGFloat, range: CGFloat) -> UInt8 {
+        UInt8(max(0, min(255, Int((128 + max(-1, min(1, input)) * range).rounded()))))
+    }
+
+    func moveLeft(_ point: CGPoint) {
+        if manualRunning {
+            leftStick = point
+            return
+        }
+        guard point.y < -0.15, !benchRunning, !stopRunning,
+              heartbeatRunning, videoReady, controlReady, includeCommandInChecksum,
+              appState == "Active", let c = control,
+              let last = lastPacket, Date().timeIntervalSince(last) < 1 else { return }
+        stopHeartbeat()
+        activeChecksumIncludesCommand = true
+        benchSent = 0
+        leftStick = point
+        rightStick = .zero
+        let id = session
+        let token = UUID()
+        benchID = token
+        benchRunning = true
+        manualRunning = true
+        benchStatus = "Manual bench — hold left stick; release to stop"
+        log("Manual joystick bench started")
+        benchTask = Task { @MainActor [weak self] in
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(3))
+            // Same centered prelude as the successful V9 sequence.
+            for tick in 0..<63 {
+                guard let self = self, !Task.isCancelled, self.session == id,
+                      self.benchID == token, self.manualRunning else { return }
+                guard self.videoReady, self.controlReady, self.appState == "Active",
+                      clock.now < deadline, let last = self.lastPacket,
+                      Date().timeIntervalSince(last) < 1 else {
+                    self.emergencyStop()
+                    return
+                }
+                if tick < 13 {
+                    self.sendBench(0, throttle: 128, connection: c)
+                } else {
+                    self.sendBench(0, throttle: self.axis(-self.leftStick.y, range: 64),
+                                   roll: self.axis(self.rightStick.x, range: 32),
+                                   pitch: self.axis(-self.rightStick.y, range: 32),
+                                   yaw: self.axis(self.leftStick.x, range: 32), connection: c)
+                }
+                try? await Task.sleep(nanoseconds: 40_000_000)
+            }
+            guard let self = self, !Task.isCancelled, self.session == id,
+                  self.benchID == token else { return }
+            self.emergencyStop()
+        }
+    }
+
+    func releaseLeft() {
+        if manualRunning { emergencyStop() }
+    }
+
+    func moveRight(_ point: CGPoint) {
+        if manualRunning { rightStick = point }
+    }
+
+    func releaseRight() {
+        rightStick = .zero
+    }
 
     // E58-style packet, independently implemented from the documented wire format.
     // https://github.com/popolony2k/maritaca-e88-controller
     // Propeller-free bench diagnostics only; startup flags may spin motors.
-    private func sendBench(_ flag: UInt8, throttle t: UInt8 = 0, connection c: NWConnection) {
-        let r: UInt8 = 0x80, p: UInt8 = 0x80, y: UInt8 = 0x80
+    private func sendBench(_ flag: UInt8, throttle t: UInt8 = 0,
+                           roll r: UInt8 = 0x80, pitch p: UInt8 = 0x80,
+                           yaw y: UInt8 = 0x80, connection c: NWConnection) {
         let id = session
         let checksum = r ^ p ^ t ^ y ^ (activeChecksumIncludesCommand ? flag : 0)
         let packet = Data([0x66, r, p, t, y, flag, checksum, 0x99])
@@ -83,6 +154,7 @@ final class DroneDiagnostics: ObservableObject {
                 guard let self = self, self.session == id else { return }
                 if let error = error {
                     self.log("Bench send error: \(error)")
+                    if self.benchRunning { self.emergencyStop() }
                     self.benchStatus = "Send failed — power off drone"
                     self.cancelBench()
                     self.stopHeartbeat()
@@ -98,6 +170,9 @@ final class DroneDiagnostics: ObservableObject {
         benchTask?.cancel()
         benchTask = nil
         benchRunning = false
+        manualRunning = false
+        leftStick = .zero
+        rightStick = .zero
     }
 
     func emergencyStop() {
@@ -110,6 +185,7 @@ final class DroneDiagnostics: ObservableObject {
         stopTask?.cancel()
         // WiFi_CAM documents emergency stop, not a separate lock flag.
         activeChecksumIncludesCommand = true
+        sendBench(0x00, throttle: 0x00, connection: c)
         sendBench(0x04, connection: c)
         let id = session
         stopRunning = true
@@ -391,17 +467,26 @@ public struct VisionFlyView: View {
     @StateObject private var drone = DroneDiagnostics()
     @State private var propsRemoved = false
     @State private var confirmMotor = false
+    @State private var joystickEnabled = false
     @Environment(\.scenePhase) private var scenePhase
+
+    private var leftAvailable: Bool {
+        propsRemoved && joystickEnabled && drone.includeCommandInChecksum &&
+        (drone.manualRunning || (drone.heartbeatRunning && !drone.benchRunning && !drone.stopRunning))
+    }
 
     public var body: some View {
         NavigationStack {
             Form {
                 Section("Safety — bench only") {
-                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V9 briefly reproduces center/up/down joystick input, without takeoff or unlock flags. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
+                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V10 adds short, limited manual joystick bench tests. Release the left stick to request shutdown. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
                         .foregroundStyle(.red)
                     Toggle("All propellers removed", isOn: $propsRemoved)
                         .onChange(of: propsRemoved) { _, value in
-                            if !value { if drone.benchRunning || drone.stopRunning { drone.emergencyStop() } else { drone.disconnect() } }
+                            if !value {
+                                joystickEnabled = false
+                                if drone.benchRunning || drone.stopRunning { drone.emergencyStop() } else { drone.disconnect() }
+                            }
                         }
                 }
                 Section("Live camera — bench only") {
@@ -426,6 +511,26 @@ public struct VisionFlyView: View {
                     if let image = drone.cameraImage, let cg = image.cgImage {
                         LabeledContent("Image pixels", value: "\(cg.width) × \(cg.height)")
                     }
+                }
+                Section("Manual joysticks — bench only") {
+                    Toggle("Enable manual bench controls", isOn: $joystickEnabled)
+                        .disabled(!propsRemoved)
+                        .onChange(of: joystickEnabled) { _, enabled in
+                            if !enabled && drone.manualRunning { drone.emergencyStop() }
+                        }
+                    Text("Start the heartbeat below, then hold the left stick up to start. Keep it held while testing the right stick. Release the left stick to stop. Every attempt times out after about 2.5 seconds; restart the heartbeat before another attempt. Directions are unverified.")
+                        .font(.footnote)
+                    HStack(alignment: .top, spacing: 16) {
+                        BenchStick(title: "Throttle / Yaw", top: "Climb", bottom: "Descend",
+                                   enabled: leftAvailable, moved: { drone.moveLeft($0) },
+                                   released: { drone.releaseLeft() })
+                        BenchStick(title: "Pitch / Roll", top: "Forward", bottom: "Back",
+                                   enabled: propsRemoved && joystickEnabled && drone.manualRunning,
+                                   moved: { drone.moveRight($0) }, released: { drone.releaseRight() })
+                    }
+                    Button("EMERGENCY STOP", role: .destructive) { drone.emergencyStop() }
+                        .disabled(!drone.controlReady)
+                    Text(drone.benchStatus).font(.footnote)
                 }
                 Section("Network — 192.168.4.153") {
                     LabeledContent("Wi-Fi path", value: drone.wifiPath)
@@ -488,15 +593,81 @@ public struct VisionFlyView: View {
                         .font(.footnote)
                 }
             }
-            .navigationTitle("VisionFly Bench V9")
+            .navigationTitle("VisionFly Bench V10")
+        }
+        .onDisappear {
+            if drone.benchRunning { drone.emergencyStop() }
+            drone.stopHeartbeat()
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active: drone.appState = "Active"
-            case .inactive: drone.appState = "Inactive"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
-            case .background: drone.appState = "Background"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
+            case .inactive: joystickEnabled = false; drone.appState = "Inactive"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
+            case .background: joystickEnabled = false; drone.appState = "Background"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
             @unknown default: drone.appState = "Unknown"
             }
         }
+    }
+}
+
+
+// A spring-centered touch control. The left release also ends the entire bench run.
+private struct BenchStick: View {
+    let title: String
+    let top: String
+    let bottom: String
+    let enabled: Bool
+    let moved: (CGPoint) -> Void
+    let released: () -> Void
+    @State private var offset = CGSize.zero
+    @GestureState private var touching = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(title).font(.caption.bold())
+            Text(top).font(.caption2)
+            GeometryReader { geo in
+                let side = min(geo.size.width, geo.size.height)
+                let limit = max(1, side * 0.33)
+                ZStack {
+                    Circle().fill(Color.secondary.opacity(0.12))
+                    Circle().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1)
+                    Path { p in
+                        p.move(to: CGPoint(x: geo.size.width / 2 - limit, y: geo.size.height / 2))
+                        p.addLine(to: CGPoint(x: geo.size.width / 2 + limit, y: geo.size.height / 2))
+                        p.move(to: CGPoint(x: geo.size.width / 2, y: geo.size.height / 2 - limit))
+                        p.addLine(to: CGPoint(x: geo.size.width / 2, y: geo.size.height / 2 + limit))
+                    }.stroke(Color.secondary.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                    Circle().fill(enabled ? Color.accentColor : Color.secondary)
+                        .frame(width: side * 0.30, height: side * 0.30)
+                        .offset(offset)
+                }
+                .contentShape(Rectangle())
+                .highPriorityGesture(
+                    DragGesture(minimumDistance: 0)
+                        .updating($touching) { _, state, _ in state = true }
+                        .onChanged { value in
+                            guard enabled else { return }
+                            let dx = value.location.x - geo.size.width / 2
+                            let dy = value.location.y - geo.size.height / 2
+                            let distance = max(limit, (dx * dx + dy * dy).squareRoot())
+                            let point = CGPoint(x: dx / distance, y: dy / distance)
+                            offset = CGSize(width: point.x * limit, height: point.y * limit)
+                            moved(point)
+                        }
+                        .onEnded { _ in offset = .zero; released() }
+                )
+            }
+            .aspectRatio(1, contentMode: .fit)
+            Text(bottom).font(.caption2)
+        }
+        .opacity(enabled ? 1 : 0.45)
+        .onChange(of: touching) { _, active in
+            if !active { offset = .zero; released() }
+        }
+        .onChange(of: enabled) { _, active in
+            if !active { offset = .zero; released() }
+        }
+        .accessibilityLabel(title + " bench joystick")
     }
 }
