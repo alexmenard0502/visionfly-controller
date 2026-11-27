@@ -80,6 +80,54 @@ final class DroneDiagnostics: ObservableObject {
     private var channelMax = [128, 128, 128, 128]
     @Published private(set) var manualExtrema = "No manual test yet"
     private var activeFullRange = false
+    @Published var controllerBenchMode = false
+    @Published var steeringSensitivity = 40
+    private var activeCenteredHold = false
+    private var activeSteeringScale: CGFloat = 1
+    @Published private(set) var preparing = false
+    private var preparationTask: Task<Void, Never>?
+
+    func cancelPreparation() {
+        preparationTask?.cancel()
+        preparationTask = nil
+        preparing = false
+    }
+
+    // Connect once, request the existing video stream, then start the known
+    // idle heartbeat. Never start manual motor control or auto-rearm.
+    func prepareController() {
+        guard !preparing, !benchRunning, !stopRunning, appState == "Active" else { return }
+        connect()
+        let id = session
+        preparing = true
+        preparationTask = Task { @MainActor [weak self] in
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(10))
+            var requested = false
+            while !Task.isCancelled && clock.now < deadline {
+                guard let self = self, self.session == id, self.appState == "Active" else { return }
+                if self.videoReady && self.controlReady {
+                    if !requested {
+                        requested = true
+                        self.requestVideo()
+                    }
+                    if let last = self.lastPacket, Date().timeIntervalSince(last) < 1 {
+                        self.startHeartbeat()
+                        self.preparing = false
+                        self.preparationTask = nil
+                        self.log("Controller ready for explicit bench input")
+                        return
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            guard let self = self, !Task.isCancelled, self.session == id else { return }
+            self.preparing = false
+            self.preparationTask = nil
+            self.log("Preparation timed out; check drone Wi-Fi and retry")
+            self.benchStatus = "Connection not ready — check Wi-Fi and retry"
+        }
+    }
 
     private func axis(_ input: CGFloat, range: CGFloat) -> UInt8 {
         let x = max(-1, min(1, input))
@@ -111,7 +159,9 @@ final class DroneDiagnostics: ObservableObject {
               let last = lastPacket, Date().timeIntervalSince(last) < 1 else { return }
         stopHeartbeat()
         activeChecksumIncludesCommand = true
-        activeFullRange = fullRangeBench
+        activeCenteredHold = controllerBenchMode
+        activeFullRange = controllerBenchMode || fullRangeBench
+        activeSteeringScale = controllerBenchMode ? CGFloat(steeringSensitivity) / 100 : 1
         channelMin = [128, 128, 128, 128]
         channelMax = [128, 128, 128, 128]
         manualChannels = "T 128 | Y 128 | P 128 | R 128"
@@ -124,13 +174,16 @@ final class DroneDiagnostics: ObservableObject {
         benchID = token
         benchRunning = true
         manualRunning = true
-        benchStatus = "Manual bench — hold left stick; release to stop"
+        benchStatus = activeCenteredHold
+            ? "Centered hold bench — STOP to end"
+            : "Manual bench — hold left stick; release to stop"
         log("Manual joystick bench started")
         benchTask = Task { @MainActor [weak self] in
             let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(15))
+            let seconds = self?.activeCenteredHold == true ? 60 : 15
+            let deadline = clock.now.advanced(by: .seconds(seconds))
             // Same centered prelude as the successful V9 sequence.
-            for tick in 0..<375 {
+            for tick in 0..<(seconds * 25) {
                 guard let self = self, !Task.isCancelled, self.session == id,
                       self.benchID == token, self.manualRunning else { return }
                 guard self.videoReady, self.controlReady, self.appState == "Active",
@@ -143,9 +196,9 @@ final class DroneDiagnostics: ObservableObject {
                     self.sendBench(0, throttle: 128, connection: c)
                 } else {
                     let t = self.axis(-self.leftStick.y, range: 64)
-                    let r = self.axis(self.rightStick.x, range: 32)
-                    let p = self.axis(-self.rightStick.y, range: 32)
-                    let y = self.axis(self.leftStick.x, range: 32)
+                    let r = self.axis(self.rightStick.x * self.activeSteeringScale, range: 32)
+                    let p = self.axis(-self.rightStick.y * self.activeSteeringScale, range: 32)
+                    let y = self.axis(self.leftStick.x * self.activeSteeringScale, range: 32)
                     self.sendBench(0, throttle: t, roll: r, pitch: p, yaw: y, connection: c)
                     self.recordManual(throttle: t, yaw: y, pitch: p, roll: r)
                 }
@@ -158,7 +211,10 @@ final class DroneDiagnostics: ObservableObject {
     }
 
     func releaseLeft() {
-        if manualRunning { emergencyStop() }
+        if manualRunning {
+            if activeCenteredHold { leftStick = .zero }
+            else { emergencyStop() }
+        }
     }
 
     func moveRight(_ point: CGPoint) {
@@ -201,12 +257,14 @@ final class DroneDiagnostics: ObservableObject {
         benchTask = nil
         benchRunning = false
         manualRunning = false
+        activeCenteredHold = false
         manualChannels = "Idle — no manual packets"
         leftStick = .zero
         rightStick = .zero
     }
 
     func emergencyStop() {
+        cancelPreparation()
         cancelBench()
         stopHeartbeat()
         guard controlReady, let c = control else {
@@ -458,6 +516,7 @@ final class DroneDiagnostics: ObservableObject {
     }
 
     func disconnect() {
+        cancelPreparation()
         if benchRunning { emergencyStop() }
         cancelBench()
         stopTask?.cancel()
@@ -499,6 +558,7 @@ public struct VisionFlyView: View {
     @State private var propsRemoved = false
     @State private var confirmMotor = false
     @State private var joystickEnabled = false
+    @State private var showController = false
     @AppStorage("visionfly.cameraQuarterTurns") private var cameraQuarterTurns = 1
     @Environment(\.scenePhase) private var scenePhase
 
@@ -507,11 +567,121 @@ public struct VisionFlyView: View {
         (drone.manualRunning || (drone.heartbeatRunning && !drone.benchRunning && !drone.stopRunning))
     }
 
+    private func exitController() {
+        drone.cancelPreparation()
+        if drone.benchRunning || drone.stopRunning { drone.emergencyStop() }
+        else { drone.stopHeartbeat() }
+        drone.controllerBenchMode = false
+        joystickEnabled = false
+        showController = false
+    }
+
+    private var controllerScreen: some View {
+        GeometryReader { geo in
+            let stickSize = min(geo.size.width * 0.31, geo.size.height * 0.43, 245)
+            ZStack {
+                Color.black
+                TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                    let fresh = drone.lastFrame.map { context.date.timeIntervalSince($0) < 2 } ?? false
+                    if fresh, let image = drone.cameraImage {
+                        let sideways = cameraQuarterTurns % 2 != 0
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: sideways ? geo.size.height : geo.size.width,
+                                   height: sideways ? geo.size.width : geo.size.height)
+                            .rotationEffect(.degrees(Double(cameraQuarterTurns) * 90))
+                            .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                    } else {
+                        Text("No fresh video").foregroundStyle(.white)
+                    }
+                }
+                .allowsHitTesting(false)
+                VStack(spacing: 8) {
+                    HStack {
+                        Button("Diagnostics") { exitController() }
+                        Spacer()
+                        Text("BENCH ONLY • NO VERIFIED FAILSAFE")
+                            .font(.caption2.bold()).foregroundStyle(.yellow)
+                        Spacer()
+                        Button {
+                            cameraQuarterTurns = (cameraQuarterTurns + 1) % 4
+                        } label: {
+                            Image(systemName: "rotate.right")
+                        }
+                        .accessibilityLabel("Rotate camera right")
+                    }
+                    .padding(8)
+                    .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 8))
+                    HStack(spacing: 10) {
+                        Button(drone.preparing ? "Connecting…" : "Connect & prepare") {
+                            if propsRemoved { joystickEnabled = true; drone.prepareController() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!propsRemoved || drone.preparing || drone.benchRunning || drone.stopRunning)
+                        Picker("Steering", selection: $drone.steeringSensitivity) {
+                            Text("Low").tag(40)
+                            Text("Med").tag(70)
+                            Text("High").tag(100)
+                        }
+                        .pickerStyle(.segmented)
+                        .disabled(drone.benchRunning || drone.stopRunning)
+                    }
+                    .padding(8)
+                    .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 8))
+                    TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                        let recent = drone.lastPacket.map { context.date.timeIntervalSince($0) < 1 } ?? false
+                        let ready = drone.videoReady && drone.controlReady && recent
+                        Text(ready ? (drone.manualRunning ? "Commands active • no aircraft ACK" : (drone.heartbeatRunning ? "Ready — push left stick up" : "Connected — prepare again to start")) : "Link not ready / stale video")
+                            .font(.caption.bold())
+                            .foregroundStyle(ready ? Color.green : Color.orange)
+                            .padding(6)
+                            .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 6))
+                    }
+                    Spacer(minLength: 4)
+                    HStack(alignment: .bottom, spacing: 8) {
+                        BenchStick(title: "Throttle / Yaw", top: "Climb", bottom: "Descend",
+                                   enabled: leftAvailable, moved: { drone.moveLeft($0) },
+                                   released: { drone.releaseLeft() })
+                            .frame(width: stickSize)
+                        Spacer(minLength: 0)
+                        BenchStick(title: "Pitch / Roll", top: "Forward", bottom: "Back",
+                                   enabled: propsRemoved && joystickEnabled && drone.manualRunning,
+                                   moved: { drone.moveRight($0) }, released: { drone.releaseRight() })
+                            .frame(width: stickSize)
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 12))
+                    Button(role: .destructive) { drone.emergencyStop() } label: {
+                        Text("STOP MOTORS").font(.headline).frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .disabled(!drone.controlReady)
+                    Text(drone.manualRunning ? "60-second maximum • " + drone.manualChannels : drone.benchStatus)
+                        .font(.caption2)
+                        .lineLimit(2)
+                        .padding(5)
+                        .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 6))
+                }
+                .padding(10)
+                .foregroundStyle(.white)
+                .environment(\.colorScheme, .dark)
+            }
+            .clipped()
+        }
+    }
+
     public var body: some View {
         NavigationStack {
+            if showController {
+                controllerScreen
+                    .toolbar(.hidden, for: .navigationBar)
+            } else {
             Form {
                 Section("Safety — bench only") {
-                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V11 adds longer manual joystick bench tests and an optional full command range. Release the left stick to request shutdown. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
+                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V12 adds a centered-hold controller screen. In diagnostics mode, release the left stick to request shutdown; in controller mode, press STOP MOTORS. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
                         .foregroundStyle(.red)
                     Toggle("All propellers removed", isOn: $propsRemoved)
                         .onChange(of: propsRemoved) { _, value in
@@ -520,6 +690,17 @@ public struct VisionFlyView: View {
                                 if drone.benchRunning || drone.stopRunning { drone.emergencyStop() } else { drone.disconnect() }
                             }
                         }
+                }
+                Section("Controller layout") {
+                    Button("Open landscape controller") {
+                        guard propsRemoved else { return }
+                        drone.controllerBenchMode = true
+                        joystickEnabled = true
+                        showController = true
+                    }
+                    .disabled(!propsRemoved || drone.benchRunning || drone.stopRunning)
+                    Text("Rotate iPad to landscape. Centered sticks keep sending neutral commands for up to 60 seconds after startup; press STOP MOTORS to end sooner. No verified aircraft-side failsafe. Propellers must remain removed.")
+                        .font(.footnote)
                 }
                 Section("Live camera — bench only") {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -656,17 +837,19 @@ public struct VisionFlyView: View {
                         .font(.footnote)
                 }
             }
-            .navigationTitle("VisionFly Bench V11")
+            .navigationTitle("VisionFly Bench V12")
+            }
         }
         .onDisappear {
+            drone.cancelPreparation()
             if drone.benchRunning { drone.emergencyStop() }
             drone.stopHeartbeat()
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active: drone.appState = "Active"
-            case .inactive: joystickEnabled = false; drone.appState = "Inactive"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
-            case .background: joystickEnabled = false; drone.appState = "Background"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
+            case .inactive: drone.cancelPreparation(); joystickEnabled = false; drone.appState = "Inactive"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
+            case .background: drone.cancelPreparation(); joystickEnabled = false; drone.appState = "Background"; if drone.benchRunning { drone.emergencyStop() }; drone.stopHeartbeat()
             @unknown default: drone.appState = "Unknown"
             }
         }
