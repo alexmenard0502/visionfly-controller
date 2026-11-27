@@ -180,19 +180,24 @@ final class DroneDiagnostics: ObservableObject {
         log("Manual joystick bench started")
         benchTask = Task { @MainActor [weak self] in
             let clock = ContinuousClock()
-            let seconds = self?.activeCenteredHold == true ? 60 : 15
-            let deadline = clock.now.advanced(by: .seconds(seconds))
-            // Same centered prelude as the successful V9 sequence.
-            for tick in 0..<(seconds * 25) {
+            // Continuous portrait bench session; only legacy diagnostic mode
+            // retains its 15-second elapsed-time limit. Link and lifecycle
+            // checks remain active. This is not a verified flight failsafe.
+            let deadline: ContinuousClock.Instant? = self?.activeCenteredHold == true
+                ? nil : clock.now.advanced(by: .seconds(15))
+            var preludeRemaining = 13
+            while !Task.isCancelled {
                 guard let self = self, !Task.isCancelled, self.session == id,
                       self.benchID == token, self.manualRunning else { return }
                 guard self.videoReady, self.controlReady, self.appState == "Active",
-                      clock.now < deadline, let last = self.lastPacket,
+                      (deadline.map { clock.now < $0 } ?? true),
+                      let last = self.lastPacket,
                       Date().timeIntervalSince(last) < 1 else {
                     self.emergencyStop()
                     return
                 }
-                if tick < 13 {
+                if preludeRemaining > 0 {
+                    preludeRemaining -= 1
                     self.sendBench(0, throttle: 128, connection: c)
                 } else {
                     let t = self.axis(-self.leftStick.y, range: 64)
@@ -583,7 +588,7 @@ public struct VisionFlyView: View {
                 HStack {
                     Button("Diagnostics") { exitController() }
                     Spacer()
-                    Text("VisionFly V12").font(.headline)
+                    Text("VisionFly V13").font(.headline)
                     Spacer()
                     Button {
                         cameraQuarterTurns = (cameraQuarterTurns + 1) % 4
@@ -673,7 +678,7 @@ public struct VisionFlyView: View {
                     Text("BENCH ONLY • NO VERIFIED FAILSAFE")
                         .font(.caption2.bold())
                         .foregroundStyle(.yellow)
-                    Text(drone.manualRunning ? "60-second maximum • " + drone.manualChannels : drone.benchStatus)
+                    Text(drone.manualRunning ? "Continuous bench • " + drone.manualChannels : drone.benchStatus)
                         .font(.caption2)
                         .lineLimit(1)
                         .minimumScaleFactor(0.7)
@@ -695,7 +700,7 @@ public struct VisionFlyView: View {
             } else {
             Form {
                 Section("Safety — bench only") {
-                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V12 adds a centered-hold controller screen. In diagnostics mode, release the left stick to request shutdown; in controller mode, press STOP MOTORS. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
+                    Text("Remove all propellers and secure the drone. The video request may change control mode. The optional idle heartbeat is unverified on this aircraft. Keep hands clear. V13 removes the elapsed-time limit in the centered-hold controller screen; link and lifecycle stop requests still apply. In diagnostics mode, release the left stick to request shutdown; in controller mode, press STOP MOTORS. NEVER fit propellers for this test. Secure the drone and keep hands clear; be ready to cut power.")
                         .foregroundStyle(.red)
                     Toggle("All propellers removed", isOn: $propsRemoved)
                         .onChange(of: propsRemoved) { _, value in
@@ -713,7 +718,7 @@ public struct VisionFlyView: View {
                         showController = true
                     }
                     .disabled(!propsRemoved || drone.benchRunning || drone.stopRunning)
-                    Text("Hold the iPad vertically. Video and controls share one screen without scrolling. Centered sticks keep sending neutral commands for up to 60 seconds after startup; press STOP MOTORS to end sooner. No verified aircraft-side failsafe. Propellers must remain removed.")
+                    Text("Hold the iPad vertically. Video and controls share one screen without scrolling. Centered sticks keep sending neutral commands without an elapsed-time limit after startup; press STOP MOTORS to end. A stale video stream or app interruption can still request immediate motor shutdown. No verified aircraft-side failsafe. Propellers must remain removed.")
                         .font(.footnote)
                 }
                 Section("Live camera — bench only") {
@@ -847,11 +852,11 @@ public struct VisionFlyView: View {
                     }
                 }
                 Section("Limitations") {
-                    Text("UDP readiness does not prove the aircraft receives control commands. Heartbeat send counts are not acknowledgements. JPEG decoding is experimental; missing or reordered packets may corrupt frames. No verified flight controls or failsafe. Motor-start and stop are experimental. Do not fly this test.")
+                    Text("The portrait bench session has no fixed time limit, but one second without incoming video, a network error or an app interruption can trigger a motor stop request. Do not fly with propellers fitted. UDP readiness does not prove the aircraft receives control commands. Heartbeat send counts are not acknowledgements. JPEG decoding is experimental; missing or reordered packets may corrupt frames. No verified flight controls or failsafe. Motor-start and stop are experimental. Do not fly this test.")
                         .font(.footnote)
                 }
             }
-            .navigationTitle("VisionFly Bench V12")
+            .navigationTitle("VisionFly Bench V13")
             }
         }
         .onDisappear {
